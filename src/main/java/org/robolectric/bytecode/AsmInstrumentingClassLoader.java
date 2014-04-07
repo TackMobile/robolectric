@@ -134,7 +134,8 @@ public class AsmInstrumentingClassLoader extends ClassLoader implements Opcodes,
         throw new ClassNotFoundException("couldn't load " + className, e);
       }
 
-      ClassNode classNode = new ClassNode() {
+      final ClassReader classReader = new ClassReader(origClassBytes);
+      ClassNode classNode = new ClassNode(Opcodes.ASM4) {
         @Override
         public FieldVisitor visitField(int access, String name, String desc, String signature, Object value) {
           desc = remapParamType(desc);
@@ -148,7 +149,6 @@ public class AsmInstrumentingClassLoader extends ClassLoader implements Opcodes,
         }
       };
 
-      final ClassReader classReader = new ClassReader(origClassBytes);
       classReader.accept(classNode, 0);
 
       try {

@@ -2,10 +2,12 @@ package org.robolectric.shadows;
 
 import android.accounts.Account;
 import android.content.ContentProvider;
+import android.content.ContentProviderClient;
 import android.content.ContentProviderOperation;
 import android.content.ContentProviderResult;
 import android.content.ContentResolver;
 import android.content.ContentValues;
+import android.content.IContentProvider;
 import android.content.OperationApplicationException;
 import android.content.PeriodicSync;
 import android.database.ContentObserver;
@@ -17,6 +19,7 @@ import org.robolectric.AndroidManifest;
 import org.robolectric.Robolectric;
 import org.robolectric.annotation.Implementation;
 import org.robolectric.annotation.Implements;
+import org.robolectric.annotation.RealObject;
 import org.robolectric.internal.NamedStream;
 import org.robolectric.res.ContentProviderData;
 import org.robolectric.tester.android.database.TestCursor;
@@ -36,12 +39,15 @@ public class ShadowContentResolver {
   private int nextDatabaseIdForInserts;
   private int nextDatabaseIdForUpdates;
 
+  @RealObject ContentResolver realContentResolver;
+
   private TestCursor cursor;
   private final List<InsertStatement> insertStatements = new ArrayList<InsertStatement>();
   private final List<UpdateStatement> updateStatements = new ArrayList<UpdateStatement>();
   private final List<DeleteStatement> deleteStatements = new ArrayList<DeleteStatement>();
   private List<NotifiedUri> notifiedUris = new ArrayList<NotifiedUri>();
-  private HashMap<Uri, TestCursor> uriCursorMap = new HashMap<Uri, TestCursor>();
+  private Map<Uri, TestCursor> uriCursorMap = new HashMap<Uri, TestCursor>();
+  private Map<Uri, InputStream> inputStreamMap = new HashMap<Uri, InputStream>();
   private final Map<String, ArrayList<ContentProviderOperation>> contentProviderOperations = new HashMap<String, ArrayList<ContentProviderOperation>>();
   private ContentProviderResult[] contentProviderResults;
 
@@ -78,19 +84,18 @@ public class ShadowContentResolver {
     public List<PeriodicSync> syncs = new ArrayList<PeriodicSync>();
   }
 
+  public void registerInputStream(Uri uri, InputStream inputStream) {
+    inputStreamMap.put(uri, inputStream);
+  }
+
   @Implementation
   public final InputStream openInputStream(final Uri uri) {
-
-    if (uri != null && ContentResolver.SCHEME_ANDROID_RESOURCE.equals(uri.getScheme())) {
-      String path = uri.getPath();
-      // check that path is a numerical resource id
-      if (path != null && path.matches("/[0-9]+")) {
-        int resourceId = Integer.parseInt(path.substring(1));
-        return Robolectric.application.getResources().openRawResource(resourceId);
-      }
+    InputStream inputStream = inputStreamMap.get(uri);
+    if (inputStream != null) {
+      return inputStream;
+    } else {
+      return new UnregisteredInputStream(uri);
     }
-
-    return new MyInputStream(uri);
   }
 
   @Implementation
@@ -148,6 +153,91 @@ public class ShadowContentResolver {
           sortOrder);
       return returnCursor;
     }
+  }
+
+  @Implementation
+  public String getType(Uri uri) {
+    ContentProvider provider = getProvider(uri);
+    if (provider != null) {
+      return provider.getType(uri);
+    } else {
+      return null;
+    }
+  }
+
+  @Implementation
+  public Bundle call(Uri uri, String method, String arg, Bundle extras) {
+    ContentProvider cp = getProvider(uri);
+    if (cp != null) {
+      return cp.call(method, arg, extras);
+    } else {
+      return null;
+    }
+  }
+
+  @Implementation
+  public final ContentProviderClient acquireContentProviderClient(String name) {
+    ContentProvider provider = getProvider(name);
+    if (provider == null) return null;
+    return getContentProviderClient(provider, true);
+  }
+
+  @Implementation
+  public final ContentProviderClient acquireContentProviderClient(Uri uri) {
+    ContentProvider provider = getProvider(uri);
+    if (provider == null) return null;
+    return getContentProviderClient(provider, true);
+  }
+
+  @Implementation
+  public final ContentProviderClient acquireUnstableContentProviderClient(String name) {
+    ContentProvider provider = getProvider(name);
+    if (provider == null) return null;
+    return getContentProviderClient(provider, false);
+  }
+
+  @Implementation
+  public final ContentProviderClient acquireUnstableContentProviderClient(Uri uri) {
+    ContentProvider provider = getProvider(uri);
+    if (provider == null) return null;
+    return getContentProviderClient(provider, false);
+  }
+
+  private ContentProviderClient getContentProviderClient(ContentProvider provider, boolean stable) {
+    ContentProviderClient client =
+        Robolectric.newInstance(ContentProviderClient.class,
+            new Class[] {ContentResolver.class, IContentProvider.class, boolean.class},
+            new Object[] {realContentResolver, provider.getIContentProvider(), stable});
+    Robolectric.shadowOf(client).setContentProvider(provider);
+    return client;
+  }
+
+  @Implementation
+  public final IContentProvider acquireProvider(String name) {
+    return acquireUnstableProvider(name);
+  }
+
+  @Implementation
+  public final IContentProvider acquireProvider(Uri uri) {
+    return acquireUnstableProvider(uri);
+  }
+
+  @Implementation
+  public final IContentProvider acquireUnstableProvider(String name) {
+    ContentProvider cp = getProvider(name);
+    if (cp != null) {
+      return cp.getIContentProvider();
+    }
+    return null;
+  }
+
+  @Implementation
+  public final IContentProvider acquireUnstableProvider(Uri uri) {
+    ContentProvider cp = getProvider(uri);
+    if (cp != null) {
+      return cp.getIContentProvider();
+    }
+    return null;
   }
 
   @Implementation
@@ -282,18 +372,21 @@ public class ShadowContentResolver {
     if (uri == null || !ContentResolver.SCHEME_CONTENT.equals(uri.getScheme())) {
       return null;
     }
+    return getProvider(uri.getAuthority());
+  }
 
-    if (!providers.containsKey(uri.getAuthority())) {
+  private static ContentProvider getProvider(String authority) {
+    if (!providers.containsKey(authority)) {
       AndroidManifest manifest = Robolectric.getShadowApplication().getAppManifest();
       if (manifest != null) {
         for (ContentProviderData providerData : manifest.getContentProviders()) {
-          if (providerData.getAuthority().equals(uri.getAuthority())) {
+          if (providerData.getAuthority().equals(authority)) {
             providers.put(providerData.getAuthority(), createAndInitialize(providerData));
           }
         }
       }
     }
-    return providers.get(uri.getAuthority());
+    return providers.get(authority);
   }
 
   public static void registerProvider(String authority, ContentProvider provider) {
@@ -508,16 +601,16 @@ public class ShadowContentResolver {
     }
   }
 
-  private static class MyInputStream extends InputStream implements NamedStream {
+  private static class UnregisteredInputStream extends InputStream implements NamedStream {
     private final Uri uri;
 
-    public MyInputStream(Uri uri) {
+    public UnregisteredInputStream(Uri uri) {
       this.uri = uri;
     }
 
     @Override
     public int read() throws IOException {
-      throw new UnsupportedOperationException();
+      throw new UnsupportedOperationException("You must use ShadowContentResolver.registerInputStream() in order to call read()");
     }
 
     @Override
